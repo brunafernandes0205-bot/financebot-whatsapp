@@ -7,113 +7,101 @@ const app = express()
 app.use(express.urlencoded({ extended: false }))
 app.use(express.json())
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY)
+const ai = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
+const db = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY)
+const hist = new Map()
 
-const chatHistories = new Map()
-
-function getHistory(phone) {
-  if (!chatHistories.has(phone)) chatHistories.set(phone, [])
-  return chatHistories.get(phone)
+const addHist = (p, role, content) => {
+  if (!hist.has(p)) hist.set(p, [])
+  const h = hist.get(p)
+  h.push({ role, content })
+  if (h.length > 20) h.splice(0, h.length - 20)
 }
 
-function addToHistory(phone, role, content) {
-  const history = getHistory(phone)
-  history.push({ role, content })
-  if (history.length > 20) history.splice(0, history.length - 20)
+const getBal = async (p) => {
+  const { data } = await db.from('users').select('balance').eq('phone', p).single()
+  return Number(data?.balance ?? 0)
 }
 
-async function getBalance(phone) {
-  const { data } = await supabase.from('users').select('balance').eq('phone', phone).single()
-  return data?.balance ?? 0
+const updBal = async (p, delta) => {
+  const cur = await getBal(p)
+  await db.from('users').upsert({ phone: p, balance: cur + delta, updated_at: new Date().toISOString() }, { onConflict: 'phone' })
 }
 
-async function updateBalance(phone, delta) {
-  const current = await getBalance(phone)
-  await supabase.from('users').upsert(
-    { phone, balance: current + delta, updated_at: new Date().toISOString() },
-    { onConflict: 'phone' }
-  )
+const saveTx = async (p, tx) => {
+  await db.from('transactions').insert({ phone: p, description: tx.description, amount: tx.amount, category: tx.category, type: tx.type, date: new Date().toLocaleDateString('pt-BR'), created_at: new Date().toISOString() })
 }
 
-async function saveTransaction(phone, tx) {
-  await supabase.from('transactions').insert({
-    phone,
-    description: tx.description,
-    amount: tx.amount,
-    category: tx.category,
-    type: tx.type,
-    date: new Date().toLocaleDateString('pt-BR'),
-    created_at: new Date().toISOString()
-  })
-}
-
-async function getTransactions(phone, limit = 10) {
-  const { data } = await supabase
-    .from('transactions').select('*').eq('phone', phone)
-    .order('created_at', { ascending: false }).limit(limit)
+const getTx = async (p, limit = 10) => {
+  const { data } = await db.from('transactions').select('*').eq('phone', p).order('created_at', { ascending: false }).limit(limit)
   return data ?? []
 }
 
-async function buildSystemPrompt(phone) {
-  const balance = await getBalance(phone)
-  const transactions = await getTransactions(phone, 10)
-  const expense = transactions.filter(t => t.type === 'out').reduce((s, t) => s + Number(t.amount), 0)
-  const income  = transactions.filter(t => t.type === 'in').reduce((s, t) => s + Number(t.amount), 0)
+const buildPrompt = async (p) => {
+  const bal = await getBal(p)
+  const txs = await getTx(p, 10)
+  const inc = txs.filter(t => t.type === 'in').reduce((s, t) => s + Number(t.amount), 0)
+  const exp = txs.filter(t => t.type === 'out').reduce((s, t) => s + Number(t.amount), 0)
   const cats = {}
-  transactions.filter(t => t.type === 'out').forEach(t => { cats[t.category] = (cats[t.category] || 0) + Number(t.amount) })
-  const catStr = Object.entries(cats).map(([k, v]) => `${k}: R$${v.toFixed(2)}`).join(', ') || 'nenhum gasto ainda'
-  const recent = transactions.map(t => `${t.date}: ${t.type==='in'?'+':'-'}R$${t.amount} — ${t.description} (${t.category})`).join('\n') || 'nenhuma'
-
-  return `Você é um assistente financeiro pessoal via WhatsApp. Responda SEMPRE em português brasileiro de forma curta (máximo 4 linhas).
-
-DADOS DO USUÁRIO:
-- Saldo: R$ ${Number(balance).toFixed(2)}
-- Entradas: R$ ${income.toFixed(2)}
-- Saídas: R$ ${expense.toFixed(2)}
-- Por categoria: ${catStr}
-- Últimas transações:\n${recent}
-
-COMO REGISTRAR: quando o usuário mencionar gasto ou receita, confirme e adicione no fim:
-REGISTRAR:{"description":"Nome","amount":50.00,"category":"alimentacao","type":"out"}
-
-Categorias: alimentacao, moradia, transporte, saude, lazer, educacao, receita, outros
-Para receitas use type:"in" e category:"receita"
-
-COMANDOS: saldo, resumo, historico, ajuda — responda diretamente sem chamar IA.`
+  txs.filter(t => t.type === 'out').forEach(t => { cats[t.category] = (cats[t.category] || 0) + Number(t.amount) })
+  const catStr = Object.entries(cats).map(([k, v]) => `${k}: R$${v.toFixed(2)}`).join(', ') || 'nenhum'
+  const rec = txs.map(t => `${t.date}: ${t.type === 'in' ? '+' : '-'}R$${t.amount} ${t.description}`).join('\n') || 'nenhuma'
+  return `Você é um assistente financeiro via WhatsApp. Responda em português, máximo 4 linhas.
+Saldo: R$${bal.toFixed(2)} | Entradas: R$${inc.toFixed(2)} | Saídas: R$${exp.toFixed(2)}
+Categorias: ${catStr}
+Transações:\n${rec}
+Quando detectar gasto/receita, confirme e adicione no fim: REGISTRAR:{"description":"x","amount":0,"category":"alimentacao","type":"out"}
+Categorias: alimentacao, moradia, transporte, saude, lazer, educacao, receita, outros`
 }
 
-async function handleCommand(phone, msg) {
-  const cmd = msg.trim().toLowerCase()
-  if (cmd === 'saldo') {
-    const b = await getBalance(phone)
-    return `💰 Saldo atual: *R$ ${Number(b).toFixed(2)}*`
-  }
-  if (cmd === 'resumo') {
-    const txs = await getTransactions(phone, 50)
+const cmd = async (p, msg) => {
+  const m = msg.trim().toLowerCase()
+  if (m === 'saldo') return `💰 Saldo: *R$ ${(await getBal(p)).toFixed(2)}*`
+  if (m === 'resumo') {
+    const txs = await getTx(p, 50)
     const cats = {}
-    txs.filter(t => t.type === 'out').forEach(t => { cats[t.category] = (cats[t.category]||0) + Number(t.amount) })
-    if (!Object.keys(cats).length) return '📊 Nenhum gasto registrado ainda.'
-    const lines = Object.entries(cats).sort((a,b)=>b[1]-a[1]).map(([k,v])=>`• ${k}: R$ ${v.toFixed(2)}`).join('\n')
-    return `📊 *Gastos por categoria:*\n${lines}`
+    txs.filter(t => t.type === 'out').forEach(t => { cats[t.category] = (cats[t.category] || 0) + Number(t.amount) })
+    if (!Object.keys(cats).length) return '📊 Nenhum gasto ainda.'
+    return '📊 *Gastos:*\n' + Object.entries(cats).sort((a, b) => b[1] - a[1]).map(([k, v]) => `• ${k}: R$${v.toFixed(2)}`).join('\n')
   }
-  if (cmd === 'historico') {
-    const txs = await getTransactions(phone, 5)
+  if (m === 'historico') {
+    const txs = await getTx(p, 5)
     if (!txs.length) return '📋 Nenhuma transação ainda.'
-    return '📋 *Últimas transações:*\n' + txs.map(t=>`${t.type==='in'?'🟢':'🔴'} ${t.description} — R$ ${Number(t.amount).toFixed(2)}`).join('\n')
+    return '📋 *Últimas:*\n' + txs.map(t => `${t.type === 'in' ? '🟢' : '🔴'} ${t.description} R$${Number(t.amount).toFixed(2)}`).join('\n')
   }
-  if (cmd === 'ajuda') {
-    return `🤖 *FinanceBot — Comandos:*\n• *saldo* — ver saldo\n• *resumo* — gastos por categoria\n• *historico* — últimas transações\n• *ajuda* — esta mensagem\n\nOu fale natural: _"gastei R$ 50 no mercado"_`
-  }
+  if (m === 'ajuda') return '🤖 *Comandos:*\n• saldo\n• resumo\n• historico\n• ajuda\n\nOu fale: _"gastei R$50 no mercado"_'
   return null
 }
 
 app.post('/webhook', async (req, res) => {
   const twiml = new twilio.twiml.MessagingResponse()
   try {
-    const userMsg = req.body.Body?.trim() || ''
-    const phone   = req.body.From || ''
-    if (!userMsg || !phone) { res.type('text/xml').send(twiml.toString()); return }
+    const msg = req.body.Body?.trim() || ''
+    const phone = req.body.From || ''
+    if (!msg || !phone) { res.type('text/xml').send(twiml.toString()); return }
+    const cmdReply = await cmd(phone, msg)
+    if (cmdReply) { twiml.message(cmdReply); res.type('text/xml').send(twiml.toString()); return }
+    const system = await buildPrompt(phone)
+    addHist(phone, 'user', msg)
+    const resp = await ai.messages.create({ model: 'claude-sonnet-4-20250514', max_tokens: 500, system, messages: hist.get(phone) })
+    let reply = resp.content[0]?.text || 'Não entendi.'
+    const match = reply.match(/REGISTRAR:(\{[^}]+\})/)
+    if (match) {
+      try {
+        const tx = JSON.parse(match[1])
+        await saveTx(phone, tx)
+        await updBal(phone, tx.type === 'in' ? Number(tx.amount) : -Number(tx.amount))
+        reply = reply.replace(/REGISTRAR:\{[^}]+\}/, '').trim()
+      } catch (e) {}
+    }
+    addHist(phone, 'assistant', reply)
+    twiml.message(reply)
+  } catch (e) {
+    console.error(e)
+    twiml.message('❌ Erro. Tente novamente.')
+  }
+  res.type('text/xml').send(twiml.toString())
+})
 
-    const cmdReply = await handleCommand(phone, userMsg)
-    if (cmdReply) { twiml.message(cmdReply); res.type('text/xml').send(twiml.toString());
+app.get('/', (req, res) => res.json({ status: 'FinanceBot online ✅' }))
+app.listen(process.env.PORT || 3000, () => console.log('🚀 Bot no ar!'))
